@@ -1,0 +1,1 @@
+docker run -d --name webinar-processor-container -v C:\PATH\TO\source:/source -v C:\PATH\TO\output:/app/output -e VIDEO_DIR=/source -e OUTPUT_DIR=/app/output webinar-processor
