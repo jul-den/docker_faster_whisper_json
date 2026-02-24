@@ -26,16 +26,114 @@ _whisper_model = None
 # 2. Вспомогательные функции (низкоуровневые операции)
 # ------------------------------------------------------------
 def get_whisper_model():
-    """Ленивая загрузка модели Whisper."""
+    """Ленивая загрузка модели Whisper с автоматическим переключением офлайн/онлайн."""
     global _whisper_model
     if _whisper_model is None:
         print(f"=== Загружаем Whisper ({WHISPER_MODEL}) на CPU ===", flush=True)
-        # Принудительный офлайн-режим (модель должна быть уже в кэше)
+        # Сначала пробуем загрузить локально (офлайн)
+        try:
+            _whisper_model = WhisperModel(
+                WHISPER_MODEL,
+                device="cpu",
+                compute_type="int8",
+                local_files_only=True
+            )
+            print("=== Модель успешно загружена из кэша ===", flush=True)
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Проверяем, связана ли ошибка с отсутствием локальной копии
+            if any(key in error_msg for key in ["local_files_only", "no such file", "cannot find", "offline"]):
+                print("=== Модель не найдена в кэше. Пробуем загрузить из интернета... ===", flush=True)
+                try:
+                    _whisper_model = WhisperModel(
+                        WHISPER_MODEL,
+                        device="cpu",
+                        compute_type="int8",
+                        local_files_only=False
+                    )
+                    print("=== Модель успешно загружена из интернета и сохранена в кэш ===", flush=True)
+                except Exception as e2:
+                    print("=== Не удалось загрузить модель даже из интернета ===", flush=True)
+                    print(e2, flush=True)
+                    raise RuntimeError("Не удалось загрузить модель Whisper. Проверьте подключение к интернету или наличие модели в кэше.") from e2
+            else:
+                # Другая ошибка
+                print("=== Ошибка при загрузке модели (не связанная с отсутствием локальной копии) ===", flush=True)
+                print(e, flush=True)
+                raise
+        print(f"=== Завершена загрузка Whisper ({WHISPER_MODEL}) ===", flush=True)
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
-        _whisper_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-        print(f"=== Завершена загрузка Whisper ({WHISPER_MODEL}) ===", flush=True)
     return _whisper_model
+
+def resolve_file_list(input_spec, base_dir):
+    """
+    Преобразует входную спецификацию в список файлов.
+    input_spec может быть строкой (одна маска) или списком строк (маски или точные имена).
+    Возвращает отсортированный список Path объектов.
+    """
+    if isinstance(input_spec, str):
+        patterns = [input_spec]
+    elif isinstance(input_spec, list):
+        patterns = input_spec
+    else:
+        raise TypeError("input должен быть строкой или списком строк")
+
+    files = []
+    for pat in patterns:
+        # Если pat содержит glob-символы (*?), раскрываем, иначе считаем точным именем
+        if any(c in pat for c in '*?[]'):
+            found = sorted(base_dir.glob(pat))
+        else:
+            # Точное имя файла
+            p = base_dir / pat
+            if p.exists():
+                found = [p]
+            else:
+                found = []
+        files.extend(found)
+
+    if not files:
+        raise FileNotFoundError(f"Не найдено файлов по спецификации {input_spec} в {base_dir}")
+    # Удаляем дубликаты (если вдруг одна маска перекрывает другую) и сортируем
+    unique = sorted(set(files), key=lambda p: p.name)
+    return unique
+
+def get_audio_params(file_path):
+    """Возвращает (sample_rate, channels) аудиофайла через ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=sample_rate,channels",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(file_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    lines = result.stdout.strip().split()
+    # Ожидаем две строки: sample_rate и channels
+    if len(lines) >= 2:
+        ar = int(lines[0])
+        ac = int(lines[1])
+    else:
+        # Если не удалось, пробуем другие методы или ставим значения по умолчанию
+        # Например, используем ffprobe с выводом в JSON
+        cmd_json = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "a:0",
+            "-show_entries", "stream=sample_rate,channels",
+            "-of", "json",
+            str(file_path)
+        ]
+        res = subprocess.run(cmd_json, capture_output=True, text=True, check=True)
+        import json
+        data = json.loads(res.stdout)
+        streams = data.get("streams", [])
+        if streams:
+            ar = int(streams[0].get("sample_rate", 16000))
+            ac = int(streams[0].get("channels", 1))
+        else:
+            ar, ac = 16000, 1
+    return ar, ac
 
 def create_full_video(ts_files, output_video):
     """Склеивает список .ts файлов в один видеофайл (через concat demuxer)."""
@@ -144,26 +242,98 @@ def find_input_file(filename, task_name):
 # 3. Функции для выполнения шагов из JSON
 # ------------------------------------------------------------
 def step_concat(step, task_name, settings):
-    """Шаг склейки файлов (поддерживается маска во входном параметре)."""
-    input_pattern = step["input"]
+    """Шаг склейки файлов (поддерживает видео и аудио)."""
+    input_spec = step["input"]
     output_file = step["output"]
-    # Поиск файлов по маске в /source
+    media_type = step.get("type", "video")  # по умолчанию video для обратной совместимости
+
+    # Раскрываем входные файлы (всегда в VIDEO_DIR)
     source_dir = Path(VIDEO_DIR)
-    input_files = sorted(source_dir.glob(input_pattern))
-    if not input_files:
-        raise FileNotFoundError(f"Нет файлов по маске {input_pattern} в {source_dir}")
+    input_files = resolve_file_list(input_spec, source_dir)
 
     output_path = Path(OUTPUT_DIR) / task_name / output_file
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Определяем тип: видео или аудио (по умолчанию видео)
-    media_type = step.get("type", "video")
+    if output_path.exists():
+        print(f"Файл {output_path} уже существует, пропускаем concat.", flush=True)
+        return
+
     if media_type == "video":
+        # Используем существующую функцию для видео (копирование без перекодирования)
         create_full_video(input_files, output_path)
+        return
+
+    elif media_type == "audio":
+        # Определяем целевые параметры аудио
+        params = step.get("params", {})
+        ar_target = params.get("ar")
+        ac_target = params.get("ac")
+
+        # Если параметры не заданы или "auto" – определяем по минимальным значениям среди файлов
+        if ar_target == "auto" or ac_target == "auto" or (ar_target is None and ac_target is None):
+            min_ar = float('inf')
+            min_ac = float('inf')
+            for f in input_files:
+                ar, ac = get_audio_params(f)
+                min_ar = min(min_ar, ar)
+                min_ac = min(min_ac, ac)
+            ar_target = min_ar if ar_target is None or ar_target == "auto" else ar_target
+            ac_target = min_ac if ac_target is None or ac_target == "auto" else ac_target
+        else:
+            # Если заданы конкретные числа, используем их
+            ar_target = ar_target if ar_target is not None else 16000
+            ac_target = ac_target if ac_target is not None else 1
+
+        # Подготавливаем временные файлы, если требуется перекодирование
+        temp_files = []
+        try:
+            for i, f in enumerate(input_files):
+                # Проверяем параметры исходного файла
+                ar_src, ac_src = get_audio_params(f)
+                if ar_src == ar_target and ac_src == ac_target:
+                    # Совпадает – используем оригинал
+                    temp_files.append(f)
+                else:
+                    # Нужно перекодировать
+                    temp = output_path.parent / f"temp_concat_{i:04d}.wav"
+                    cmd = [
+                        "ffmpeg", "-y",
+                        "-i", str(f),
+                        "-ar", str(ar_target),
+                        "-ac", str(ac_target),
+                        "-acodec", "pcm_s16le",
+                        str(temp)
+                    ]
+                    print(f"  Перекодируем {f.name} -> {temp.name}", flush=True)
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    temp_files.append(temp)
+
+            # Теперь все файлы в едином формате, склеиваем через concat demuxer
+            list_file = output_path.parent / "concat_audio_list.txt"
+            with open(list_file, "w") as f:
+                for tf in temp_files:
+                    f.write(f"file '{tf}'\n")
+
+            cmd_concat = [
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                "-i", str(list_file),
+                "-c", "copy", str(output_path)
+            ]
+            print(f"  Склеиваем аудио в {output_path.name}", flush=True)
+            subprocess.run(cmd_concat, check=True, capture_output=True)
+
+        finally:
+            # Удаляем временные файлы (кроме оригиналов)
+            for tf in temp_files:
+                if tf not in input_files:
+                    tf.unlink(missing_ok=True)
+            # Удаляем временный список
+            if 'list_file' in locals():
+                list_file.unlink(missing_ok=True)
+
+        print(f"  Аудио склеено в {output_path}", flush=True)
     else:
-        # Для аудио используем ffmpeg concat (работает с совместимыми форматами, например .ts)
-        # Но для .wav лучше использовать фильтр, поэтому пока оставим только видео
-        raise NotImplementedError("Конкатенация аудио пока не реализована, используйте type: video")
+        raise ValueError(f"Неизвестный тип media_type: {media_type}")
 
 def step_extract_audio(step, task_name, settings):
     """Извлекает аудио из видеофайла."""
@@ -291,6 +461,9 @@ def step_llm(step, task_name, settings):
 # 4. Основной цикл обработки JSON-задач
 # ------------------------------------------------------------
 def main():
+    os.environ["HF_HOME"] = "/app/cache"
+    os.makedirs("/app/cache", exist_ok=True)
+
     # Ищем все JSON-файлы в VIDEO_DIR
     json_files = list(Path(VIDEO_DIR).glob("*.json"))
     if not json_files:

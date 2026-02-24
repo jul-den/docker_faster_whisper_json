@@ -8,21 +8,21 @@ This tool automates the transcription of webinars, lectures, and other video/aud
 
 - **Batch processing** – place several JSON tasks in the `/source` folder; the script will execute them one by one.
 - **Flexible step definition** – supported operations:
-  - `concat` – concatenate video files (e.g., multiple `.ts` into one `.mp4`).
+  - `concat` – concatenate video or audio files (supports glob patterns, automatic parameter harmonisation for audio).
   - `extract_audio` – extract audio track from video to WAV (16 kHz, mono).
   - `segment` – split audio into segments by timestamps.
   - `transcribe` – speech recognition (Whisper) with glob patterns for multiple files.
   - `llm` – send text to an LLM (LM Studio) with a custom prompt.
 - **Lazy loading of Whisper model** – the model is loaded only at the first `transcribe_audio` call.
 - **Skip already completed steps** – if an output file already exists, the step is not re-executed.
-- **Offline mode** – after the model has been downloaded once, all subsequent operations work without offline.
+- **Offline mode** – after the model has been downloaded once, all subsequent operations work without internet access.
 - **Override settings** – each JSON can define its own parameters (Whisper model, LLM model, URL, etc.) which take precedence over environment variables.
 
 ## Requirements
 
 - **Docker** installed (preferably with volume mounting support).
 - **LM Studio** (optional, only if you use `llm` steps). The server must be running and accessible from the container (typically at `http://host.docker.internal:1234` for Windows/macOS).
-- **Whisper models** are cached locally (usually in ~/.cache/huggingface/hub/). On the first run without cache, the model will be downloaded – this is normal, but for offline mode the model will remain in the cache after the first download.
+- **Whisper models** can be pre‑cached (e.g., in `/app/cache`). On the first run without cache, the model will be downloaded – this is normal, but for offline mode the model will remain in the cache after the first download.
 
 ## JSON Task Structure
 
@@ -40,10 +40,17 @@ Each JSON file must contain the following fields:
 
 ### Step Parameters
 
-#### `concat` – concatenate files (any files compatible with FFmpeg concat demuxer)
-- `input` – file glob pattern (e.g., `"media_*.ts"`).
-- `output` – name of the resulting mp4 file.
-- `type` – `"video"` (only video is supported).
+#### `concat` – concatenate files (video or audio)
+
+- `input` – **a string or a list of strings** specifying the source files. Each element may contain glob characters (`*`, `?`, `[]`) to match files in the `/source` folder.  
+  Examples: `"media_*.ts"`, `["part1.wav", "part2.wav", "extra_*.wav"]`.
+- `output` – name of the resulting file (will be created in the task’s subfolder).
+- `type` – concatenation type: `"video"` or `"audio"`.  
+  - For `video`, files are simply copied (no re‑encoding) using `ffmpeg concat` – suitable for `.ts`, `.mp4`, etc.  
+  - For `audio`, all files are converted to uniform parameters and then concatenated.
+- `params` – an object with parameters for audio (ignored for video):
+  - `ar` – sample rate (Hz). If set to `"auto"`, the minimum sample rate among all input files will be used. If omitted, defaults to `16000`.
+  - `ac` – number of audio channels. If `"auto"`, the minimum channel count among the files is used. If omitted, defaults to `1`.
 
 #### `extract_audio` – extract audio
 - `input` – input video file name.
@@ -70,8 +77,29 @@ Each JSON file must contain the following fields:
 - `system` – optional system prompt.
 - `max_tokens` – maximum number of tokens in the response (default `8000`).
 
-### Example JSON for a Webinar (Multiple Steps)
+### JSON Examples
 
+#### Simple audio concatenation with auto‑detected parameters
+```json
+{
+  "type": "video_transcription",
+  "name": "concat_audio_example",
+  "steps": [
+    {
+      "action": "concat",
+      "input": ["recording1.wav", "recording2.wav", "interview_*.wav"],
+      "output": "full_interview.wav",
+      "type": "audio",
+      "params": {
+        "ar": "auto",
+        "ac": "auto"
+      }
+    }
+  ]
+}
+```
+
+#### Full webinar example (multiple steps)
 ```json
 {
   "type": "video_transcription",
@@ -159,8 +187,9 @@ Each JSON file must contain the following fields:
    ```powershell
    docker run -d `
      --name webinar-processor-container `
-     -v DRIVE:\PATH\TO\source:/source `
-     -v DRIVE:\PATH\TO\output:/app/output `
+     -v C:\PATH\TO\source:/source `
+     -v C:\PATH\TO\output:/app/output `
+     -v .\hf_cache:/app/cache `
      -e VIDEO_DIR=/source `
      -e OUTPUT_DIR=/app/output `
      -e LLM_URL="http://host.docker.internal:1234/v1/chat/completions" `
@@ -193,7 +222,7 @@ Each JSON file must contain the following fields:
 ## Notes
 
 - The Whisper model is loaded **lazily** – only at the first call to `transcribe_audio`. If all texts are already transcribed (the `.txt` files exist), the model will not be loaded at all.
-- For offline mode, it is recommended to pre‑cache the required Whisper model (e.g., by running a one‑time transcription with internet access). After that you can set the environment variables `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` (they are already set inside `get_whisper_model`).
+- For offline mode, it is recommended to pre‑cache the required Whisper model and mount the cache folder to `/app/cache`. After that you can set the environment variables `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` (they are already set inside `get_whisper_model`).
 - All paths in JSON are interpreted as relative:
   - input files are first looked up in `/output/<task_name>/`, then in `/source/`;
   - output files are always written to `/output/<task_name>/`.
