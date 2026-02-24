@@ -24,7 +24,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - The `concat` step now handles both video (preserving original copy‑based behavior) and audio.
 - Step logging now includes information about transcoding and concatenation.
-- Improved Whisper model loading: the script now first attempts to load the model from local cache (`local_files_only=True`). If the model is not found, it falls back to downloading from the internet, then automatically enables offline mode for subsequent runs.
 
 ### Fixed
 - Proper handling of cases where input files for `concat` already match the target format (no unnecessary transcoding).
